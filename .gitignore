@@ -1,0 +1,13 @@
+# IDE files
+.idea/
+.vscode/
+*.sublime-*
+
+# Composer
+/vendor/
+composer.lock
+
+# PHP
+*.cache
+*.log
+
