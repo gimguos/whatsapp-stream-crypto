@@ -11,3 +11,9 @@ composer.lock
 *.cache
 *.log
 
+# Test files
+*.test
+*.test.*
+tests/data/*.test
+tests/data/*.test.*
+

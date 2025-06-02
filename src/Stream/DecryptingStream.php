@@ -245,7 +245,8 @@ class DecryptingStream implements StreamInterface
         }
 
         // Если это последний чанк, удаляем паддинг
-        if ($this->stream->tell() >= $this->getSize()) {
+        $encryptedDataSize = $this->stream->getSize() - self::MAC_LENGTH;
+        if ($this->stream->tell() >= $encryptedDataSize) {
             $padLength = ord($decrypted[strlen($decrypted) - 1]);
             if ($padLength > 0 && $padLength <= 16) {
                 $decrypted = substr($decrypted, 0, -$padLength);

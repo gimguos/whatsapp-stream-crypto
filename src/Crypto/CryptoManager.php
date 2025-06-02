@@ -54,29 +54,7 @@ class CryptoManager
      */
     public function expandMediaKey(string $mediaKey, MediaType $type): array
     {
-        // Шаг 1: HKDF Extract
-        $salt = str_repeat("\0", 32); // Нулевая соль
-        $prk = hash_hmac('sha256', $mediaKey, $salt, true);
-
-        // Шаг 2: HKDF Expand
-        $info = $type->value; // Используем тип медиа как info
-        $expandedKey = '';
-        $previousBlock = '';
-        $blockIndex = 1;
-
-        while (strlen($expandedKey) < self::EXPANDED_KEY_LENGTH) {
-            $hmac = hash_hmac(
-                'sha256',
-                $previousBlock . $info . chr($blockIndex),
-                $prk,
-                true
-            );
-            $previousBlock = $hmac;
-            $expandedKey .= $hmac;
-            $blockIndex++;
-        }
-
-        $expandedKey = substr($expandedKey, 0, self::EXPANDED_KEY_LENGTH);
+        $expandedKey = hash_hkdf('sha256', $mediaKey, self::EXPANDED_KEY_LENGTH, $type->value, str_repeat("\0", 32));
 
         return [
             'iv' => substr($expandedKey, 0, self::IV_LENGTH),
@@ -99,7 +77,7 @@ class CryptoManager
             $data,
             'aes-256-cbc',
             $cipherKey,
-            OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING,
+            OPENSSL_RAW_DATA,
             $iv
         );
     }

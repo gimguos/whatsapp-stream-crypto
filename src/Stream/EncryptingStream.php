@@ -14,7 +14,7 @@ class EncryptingStream implements StreamInterface
 {
     private const CHUNK_SIZE = 8192; // Размер чанка для чтения (8KB)
     
-    private StreamInterface $stream;
+    private StreamInterface $sourceStream;
     private CryptoManager $cryptoManager;
     private string $mediaKey;
     private MediaType $mediaType;
@@ -22,7 +22,10 @@ class EncryptingStream implements StreamInterface
     private string $buffer = '';
     private bool $isEof = false;
     private int $position = 0;
-    private ?int $currentChunkSize = null;
+    private bool $isInitialized = false;
+    private $hmacContext = null;
+    private bool $ivWritten = false;
+    private bool $macWritten = false;
 
     /**
      * @param StreamInterface $stream Исходный поток с данными
@@ -36,7 +39,7 @@ class EncryptingStream implements StreamInterface
         MediaType $mediaType,
         CryptoManager $cryptoManager
     ) {
-        $this->stream = $stream;
+        $this->sourceStream = $stream;
         $this->mediaKey = $mediaKey;
         $this->mediaType = $mediaType;
         $this->cryptoManager = $cryptoManager;
@@ -49,6 +52,7 @@ class EncryptingStream implements StreamInterface
     {
         if ($this->expandedKey === null) {
             $this->expandedKey = $this->cryptoManager->expandMediaKey($this->mediaKey, $this->mediaType);
+            $this->hmacContext = hash_init('sha256', HASH_HMAC, $this->expandedKey['macKey']);
         }
     }
 
@@ -70,7 +74,7 @@ class EncryptingStream implements StreamInterface
      */
     public function close(): void
     {
-        $this->stream->close();
+        $this->sourceStream->close();
     }
 
     /**
@@ -78,7 +82,7 @@ class EncryptingStream implements StreamInterface
      */
     public function detach()
     {
-        return $this->stream->detach();
+        return $this->sourceStream->detach();
     }
 
     /**
@@ -112,7 +116,7 @@ class EncryptingStream implements StreamInterface
      */
     public function isSeekable(): bool
     {
-        return $this->stream->isSeekable();
+        return false; // Шифрующий поток не поддерживает seek
     }
 
     /**
@@ -120,13 +124,7 @@ class EncryptingStream implements StreamInterface
      */
     public function seek($offset, $whence = SEEK_SET): void
     {
-        if (!$this->isSeekable()) {
-            throw new \RuntimeException('Stream is not seekable');
-        }
-        
-        $this->stream->seek($offset, $whence);
-        $this->position = $this->stream->tell();
-        $this->buffer = '';
+        throw new \RuntimeException('Encrypting stream is not seekable');
     }
 
     /**
@@ -134,7 +132,7 @@ class EncryptingStream implements StreamInterface
      */
     public function rewind(): void
     {
-        $this->seek(0);
+        throw new \RuntimeException('Encrypting stream is not seekable');
     }
 
     /**
@@ -165,7 +163,7 @@ class EncryptingStream implements StreamInterface
      * Читает и шифрует данные из потока
      * 
      * @param int $length Количество байт для чтения
-     * @return string Зашифрованные данные с добавленным MAC
+     * @return string Зашифрованные данные
      */
     public function read($length): string
     {
@@ -179,38 +177,62 @@ class EncryptingStream implements StreamInterface
             return $result;
         }
 
-        // Читаем новый чанк данных
-        $chunk = $this->stream->read(self::CHUNK_SIZE);
-        if (empty($chunk)) {
-            if (strlen($this->buffer) > 0) {
-                $result = $this->buffer;
-                $this->buffer = '';
-                $this->position += strlen($result);
-                $this->isEof = true;
-                return $result;
-            }
-            $this->isEof = true;
-            return '';
+        // Добавляем IV в начало если еще не добавлен
+        if (!$this->ivWritten) {
+            hash_update($this->hmacContext, $this->expandedKey['iv']);
+            $this->buffer .= $this->expandedKey['iv'];
+            $this->ivWritten = true;
+            return $this->read($length);
         }
 
-        // Шифруем чанк
-        $encrypted = $this->cryptoManager->encrypt(
-            $chunk,
-            $this->expandedKey['iv'],
-            $this->expandedKey['cipherKey']
-        );
+        // Если исходный поток не закончился, читаем и шифруем
+        if (!$this->sourceStream->eof()) {
+            $chunk = $this->sourceStream->read(self::CHUNK_SIZE);
+            if (!empty($chunk)) {
+                // Добавляем паддинг к последнему блоку если нужно
+                if ($this->sourceStream->eof()) {
+                    $blockSize = 16; // AES block size
+                    $paddingLength = $blockSize - (strlen($chunk) % $blockSize);
+                    $chunk .= str_repeat(chr($paddingLength), $paddingLength);
+                }
 
-        // Вычисляем MAC для зашифрованного чанка
-        $mac = $this->cryptoManager->calculateMac(
-            $this->expandedKey['iv'] . $encrypted,
-            $this->expandedKey['macKey']
-        );
+                $encrypted = openssl_encrypt(
+                    $chunk,
+                    'aes-256-cbc',
+                    $this->expandedKey['cipherKey'],
+                    OPENSSL_RAW_DATA,
+                    $this->expandedKey['iv']
+                );
 
-        // Добавляем зашифрованные данные и MAC в буфер
-        $this->buffer .= $encrypted . $mac;
+                if ($encrypted === false) {
+                    throw new \RuntimeException('Encryption failed');
+                }
 
-        // Рекурсивно вызываем read для получения запрошенного количества данных
-        return $this->read($length);
+                hash_update($this->hmacContext, $encrypted);
+                $this->buffer .= $encrypted;
+                return $this->read($length);
+            }
+        }
+
+        // Если исходный поток закончился и MAC еще не добавлен
+        if (!$this->macWritten && $this->sourceStream->eof()) {
+            $mac = substr(hash_final($this->hmacContext, true), 0, 10); // Усекаем до 10 байт
+            $this->buffer .= $mac;
+            $this->macWritten = true;
+            return $this->read($length);
+        }
+
+        // Если все данные обработаны
+        if (strlen($this->buffer) > 0) {
+            $result = $this->buffer;
+            $this->buffer = '';
+            $this->position += strlen($result);
+            $this->isEof = true;
+            return $result;
+        }
+
+        $this->isEof = true;
+        return '';
     }
 
     /**
@@ -230,6 +252,6 @@ class EncryptingStream implements StreamInterface
      */
     public function getMetadata($key = null)
     {
-        return $this->stream->getMetadata($key);
+        return $this->sourceStream->getMetadata($key);
     }
 } 
